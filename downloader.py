@@ -17,6 +17,7 @@ import sys
 import argparse
 import concurrent.futures
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import yt_dlp
 from tqdm import tqdm
@@ -26,6 +27,22 @@ def sanitize_filename(name: str) -> str:
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', name)
     name = name.strip('. ')
     return name or 'unknown'
+
+
+def normalize_playlist_url(url: str) -> str:
+    """
+    Extrae el list= de cualquier formato de URL de YouTube y devuelve
+    una URL limpia de playlist. Soporta:
+      - https://www.youtube.com/watch?v=XXX&list=YYY&start_radio=1
+      - https://www.youtube.com/playlist?list=YYY
+      - https://youtu.be/XXX?list=YYY
+    """
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query)
+    list_id = params.get('list', [None])[0]
+    if list_id:
+        return f"https://www.youtube.com/playlist?list={list_id}"
+    return url
 
 
 def download_track(
@@ -96,6 +113,8 @@ def fetch_playlist_info(url: str) -> dict:
         'no_warnings': True,
         'extract_flat': True,
         'skip_download': True,
+        'yes_playlist': True,       # fuerza modo playlist aunque la URL lleve v=
+        'ignoreerrors': True,       # omite videos privados/eliminados sin abortar
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(url, download=False)
@@ -107,24 +126,28 @@ def download_playlist(
     quality: str = '0',
     output_base: Path = Path('.'),
 ) -> None:
-    print(f"Fetching playlist info...")
-    info = fetch_playlist_info(url)
+    # Normalizar URL: extrae list= de cualquier formato mixto de YouTube
+    clean_url = normalize_playlist_url(url)
+    if clean_url != url:
+        print(f"URL normalizada: {clean_url}")
+
+    print("Fetching playlist info...")
+    info = fetch_playlist_info(clean_url)
 
     if not info:
         print("Error: could not retrieve playlist information.")
         sys.exit(1)
 
-    if info.get('_type') != 'playlist':
-        print("Error: URL does not point to a YouTube playlist.")
+    # Aceptar _type 'playlist' y también mixes/radios que yt-dlp clasifica diferente
+    entries = [e for e in info.get('entries', []) if e]
+    if not entries:
+        print("Error: la lista está vacía, es privada o la URL no contiene una playlist.")
+        print(f"  _type detectado: {info.get('_type', 'desconocido')}")
+        print(f"  URL usada: {clean_url}")
         sys.exit(1)
 
     playlist_title = sanitize_filename(info.get('title', 'playlist'))
-    entries = [e for e in info.get('entries', []) if e]
     total = len(entries)
-
-    if total == 0:
-        print("Error: playlist is empty or private.")
-        sys.exit(1)
 
     output_dir = output_base / playlist_title
     output_dir.mkdir(parents=True, exist_ok=True)

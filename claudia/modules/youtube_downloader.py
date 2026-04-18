@@ -48,11 +48,11 @@ class YouTubeDownloaderModule(BaseModule):
         from ..core.voice import speak
         try:
             import sys
-            import os
             root = Path(__file__).parent.parent.parent
             sys.path.insert(0, str(root))
-            from downloader import download_playlist
-            download_playlist(url=url, output_base=output_dir)
+            from downloader import download_playlist, normalize_playlist_url
+            clean_url = normalize_playlist_url(url)
+            download_playlist(url=clean_url, output_base=output_dir)
             speak("La descarga de la lista de reproducción ha terminado.")
         except Exception as e:
             speak(f"Hubo un error al descargar la lista: {e}")
