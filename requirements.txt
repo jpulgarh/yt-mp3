@@ -14,6 +14,10 @@ sounddevice>=0.4.6
 webrtcvad>=2.0.10
 numpy>=1.24.0
 
+# ── Compatibilidad Python 3.12+ ───────────────────────────────────
+# webrtcvad depende de pkg_resources (eliminado en Python 3.12)
+setuptools>=68.0.0
+
 # ── TTS – Síntesis de voz ────────────────────────────────────────
 edge-tts>=6.1.9
 # pyttsx3>=2.90        # Alternativa 100% offline (descomentar si prefieres)
