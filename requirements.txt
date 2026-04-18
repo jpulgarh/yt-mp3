@@ -1,3 +1,33 @@
+# ── YouTube downloader ────────────────────────────────────────────
 yt-dlp>=2024.1.0
 tqdm>=4.66.0
 mutagen>=1.47.0
+
+# ── LLM (Ollama local) ───────────────────────────────────────────
+ollama>=0.2.0
+
+# ── STT – Reconocimiento de voz (local, sin API) ─────────────────
+faster-whisper>=1.0.0
+
+# ── Audio I/O y detección de actividad de voz ────────────────────
+sounddevice>=0.4.6
+webrtcvad>=2.0.10
+numpy>=1.24.0
+
+# ── TTS – Síntesis de voz ────────────────────────────────────────
+edge-tts>=6.1.9
+# pyttsx3>=2.90        # Alternativa 100% offline (descomentar si prefieres)
+
+# ── Monitoreo del sistema ─────────────────────────────────────────
+psutil>=5.9.0
+GPUtil>=1.4.0          # GPU Nvidia (opcional – ignora el error si no tienes GPU)
+
+# ── Configuración ─────────────────────────────────────────────────
+pyyaml>=6.0
+
+# ── Terminal UI ───────────────────────────────────────────────────
+rich>=13.0.0
+
+# ── Dependencias del sistema (instalar con apt) ───────────────────
+# sudo apt install ffmpeg mpg123 portaudio19-dev python3-dev
+# sudo apt install libffi-dev  # requerido por webrtcvad en algunos sistemas
