@@ -95,22 +95,7 @@ def download_track(
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': str(output_dir / f"{base_name}.%(ext)s"),
-        'postprocessors': [
-            {
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                # quality '0' = VBR best (~245 kbps avg, peaks 320 kbps)
-                # quality '320' = CBR 320 kbps
-                'preferredquality': quality,
-            },
-            {
-                'key': 'FFmpegMetadata',
-                'add_metadata': True,
-            },
-            {
-                'key': 'EmbedThumbnail',
-            },
-        ],
+        'postprocessors': _postprocessors(quality),
         'writethumbnail': True,
         'quiet': True,
         'no_warnings': True,
@@ -131,17 +116,66 @@ def download_track(
         progress_bar.update(1)
 
 
-def fetch_playlist_info(url: str, is_mix: bool = False) -> dict:
+def fetch_playlist_info(url: str) -> dict | None:
+    """Intenta extraer metadatos de la playlist sin descargar."""
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
         'extract_flat': True,
         'skip_download': True,
-        'yes_playlist': True,   # fuerza modo playlist aunque la URL lleve v=
-        'ignoreerrors': True,   # omite videos privados/eliminados sin abortar
+        'yes_playlist': True,
+        'ignoreerrors': True,
     }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(url, download=False)
+    except Exception:
+        return None
+
+
+def _postprocessors(quality: str) -> list:
+    return [
+        {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': quality},
+        {'key': 'FFmpegMetadata', 'add_metadata': True},
+        {'key': 'EmbedThumbnail'},
+    ]
+
+
+def download_mix_direct(url: str, output_dir: Path, quality: str) -> dict:
+    """
+    Descarga un Radio/Mix directamente sin pre-fetch de entradas.
+    Usado como fallback cuando extract_flat falla en listas RD.
+    yt-dlp maneja internamente la paginación del mix.
+    """
+    results = {'ok': 0, 'skipped': 0, 'error': 0}
+
+    def _hook(d: dict) -> None:
+        if d['status'] == 'finished':
+            fname = Path(d.get('filename', '')).stem
+            print(f"  [ok]   {fname}")
+            results['ok'] += 1
+        elif d['status'] == 'error':
+            results['error'] += 1
+
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'outtmpl': str(output_dir / '%(playlist_index)03d - %(title)s.%(ext)s'),
+        'postprocessors': _postprocessors(quality),
+        'writethumbnail': True,
+        'yes_playlist': True,
+        'ignoreerrors': True,
+        'retries': 3,
+        'fragment_retries': 3,
+        'progress_hooks': [_hook],
+        'quiet': True,
+        'no_warnings': True,
+    }
+
+    print("Descargando Radio/Mix directamente (sin pre-fetch)...")
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download=False)
+        ydl.download([url])
+
+    return results
 
 
 def download_playlist(
@@ -158,29 +192,39 @@ def download_playlist(
         print(f"URL procesada  : {clean_url}")
 
     print("Fetching playlist info...")
-    info = fetch_playlist_info(clean_url, is_mix=(url_type == 'mix'))
+    info = fetch_playlist_info(clean_url)
+    entries = [e for e in (info or {}).get('entries', []) if e]
 
-    if not info:
-        print("Error: no se pudo obtener información de la lista.")
-        sys.exit(1)
+    # Para mixes que no responden al extract_flat, descarga directa con yt-dlp
+    if not entries and url_type == 'mix':
+        print("Pre-fetch no disponible para este Mix. Cambiando a modo descarga directa...")
+        playlist_title = sanitize_filename((info or {}).get('title', 'YouTube Mix'))
+        output_dir = output_base / playlist_title
+        output_dir.mkdir(parents=True, exist_ok=True)
+        quality_label = "VBR best" if quality == '0' else f"CBR {quality} kbps"
+        print(f"Playlist : {playlist_title}")
+        print(f"Quality  : {quality_label}")
+        print(f"Output   : {output_dir.resolve()}")
+        print()
+        results = download_mix_direct(clean_url, output_dir, quality)
+        print()
+        print(f"Done — {results['ok']} downloaded, {results['error']} errors")
+        print(f"Files saved to: {output_dir.resolve()}")
+        return
 
-    entries = [e for e in info.get('entries', []) if e]
     if not entries:
         print("Error: la lista está vacía, es privada o la URL no es válida.")
-        print(f"  _type detectado : {info.get('_type', 'desconocido')}")
+        if info:
+            print(f"  _type detectado : {info.get('_type', 'desconocido')}")
         print(f"  URL usada       : {clean_url}")
-        if url_type == 'mix':
-            print("  Nota: los Radio/Mix de YouTube limitan las pistas visibles.")
-            print("  Intenta con una lista de reproducción normal (PL...).")
         sys.exit(1)
 
     playlist_title = sanitize_filename(info.get('title', 'playlist'))
     total = len(entries)
-
     output_dir = output_base / playlist_title
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    quality_label = f"VBR best (~245 kbps avg)" if quality == '0' else f"CBR {quality} kbps"
+    quality_label = "VBR best (~245 kbps avg)" if quality == '0' else f"CBR {quality} kbps"
     print(f"Playlist : {playlist_title}")
     print(f"Tracks   : {total}")
     print(f"Quality  : {quality_label}")
