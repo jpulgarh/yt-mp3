@@ -17,10 +17,16 @@ import sys
 import argparse
 import concurrent.futures
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from urllib.parse import urlparse, parse_qs
 
 import yt_dlp
 from tqdm import tqdm
+
+# Límite por defecto de canciones para Radio/Mix (YouTube los genera infinitamente)
+MIX_DEFAULT_LIMIT = 50
+
+# Prefijos de listas dinámicas que requieren el v= original para funcionar
+_DYNAMIC_LIST_PREFIXES = ('RD', 'RDEM', 'RDMIX', 'RDCLAK', 'OLA', 'FL', 'LL')
 
 
 def sanitize_filename(name: str) -> str:
@@ -29,25 +35,14 @@ def sanitize_filename(name: str) -> str:
     return name or 'unknown'
 
 
-# Prefijos de listas que YouTube genera dinámicamente y requieren el v= del video
-# para poder ser consultadas. Convertirlas a playlist?list= las rompe.
-_DYNAMIC_LIST_PREFIXES = ('RD', 'RDEM', 'RDMIX', 'RDCLAK', 'OLA', 'FL', 'LL')
-
-
 def normalize_playlist_url(url: str) -> tuple[str, str]:
     """
-    Analiza la URL y devuelve (url_para_fetch, tipo).
+    Devuelve (url_procesada, tipo).
 
     Tipos:
-      'playlist' → lista normal PL..., puede usarse como playlist?list=
-      'mix'      → Radio/Mix RD..., requiere conservar el v= original
-      'unknown'  → sin list=, se usará la URL tal cual
-
-    Soporta todos estos formatos:
-      https://www.youtube.com/watch?v=XXX&list=PLyyy
-      https://www.youtube.com/watch?v=XXX&list=RDxxx&start_radio=1
-      https://www.youtube.com/playlist?list=PLyyy
-      https://youtu.be/XXX?list=PLyyy
+      'playlist' → lista normal PL..., normalizada a playlist?list=
+      'mix'      → Radio/Mix RD..., conserva watch?v= original
+      'unknown'  → sin list=, se usa tal cual
     """
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
@@ -57,16 +52,56 @@ def normalize_playlist_url(url: str) -> tuple[str, str]:
     if not list_id:
         return url, 'unknown'
 
-    # Radio/Mix: conservar v= para que YouTube pueda generar la lista
     if list_id.startswith(_DYNAMIC_LIST_PREFIXES):
-        if video_id:
-            clean = f"https://www.youtube.com/watch?v={video_id}&list={list_id}"
-        else:
-            clean = url
+        clean = (
+            f"https://www.youtube.com/watch?v={video_id}&list={list_id}"
+            if video_id else url
+        )
         return clean, 'mix'
 
-    # Lista normal: URL canónica sin parámetros extra
     return f"https://www.youtube.com/playlist?list={list_id}", 'playlist'
+
+
+def _postprocessors(quality: str) -> list:
+    return [
+        {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': quality},
+        {'key': 'FFmpegMetadata', 'add_metadata': True},
+        {'key': 'EmbedThumbnail'},
+    ]
+
+
+def fetch_playlist_info(url: str, limit: int = 0) -> dict | None:
+    """
+    Extrae metadatos de la playlist sin descargar.
+    limit > 0 restringe a los primeros N ítems (esencial para Radio/Mix).
+    """
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': True,
+        'skip_download': True,
+        'yes_playlist': True,
+        'ignoreerrors': True,
+    }
+    if limit > 0:
+        ydl_opts['playlistend'] = limit
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(url, download=False)
+    except Exception:
+        return None
+
+
+def _dedupe_entries(entries: list) -> list:
+    """Elimina entradas duplicadas conservando el orden original."""
+    seen: set = set()
+    result = []
+    for e in entries:
+        vid = e.get('id') or e.get('url', '')
+        if vid and vid not in seen:
+            seen.add(vid)
+            result.append(e)
+    return result
 
 
 def download_track(
@@ -83,10 +118,8 @@ def download_track(
 
     url = f"https://www.youtube.com/watch?v={video_id}"
     title = sanitize_filename(entry.get('title', video_id))
-    prefix = f"{index:03d} - "
-    base_name = prefix + title
+    base_name = f"{index:03d} - {title}"
 
-    # Skip if already downloaded
     if (output_dir / f"{base_name}.mp3").exists():
         progress_bar.update(1)
         progress_bar.write(f"  [skip] {base_name}")
@@ -116,42 +149,23 @@ def download_track(
         progress_bar.update(1)
 
 
-def fetch_playlist_info(url: str) -> dict | None:
-    """Intenta extraer metadatos de la playlist sin descargar."""
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': True,
-        'skip_download': True,
-        'yes_playlist': True,
-        'ignoreerrors': True,
-    }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            return ydl.extract_info(url, download=False)
-    except Exception:
-        return None
-
-
-def _postprocessors(quality: str) -> list:
-    return [
-        {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': quality},
-        {'key': 'FFmpegMetadata', 'add_metadata': True},
-        {'key': 'EmbedThumbnail'},
-    ]
-
-
-def download_mix_direct(url: str, output_dir: Path, quality: str) -> dict:
+def download_mix_direct(url: str, output_dir: Path, quality: str, limit: int) -> dict:
     """
-    Descarga un Radio/Mix directamente sin pre-fetch de entradas.
-    Usado como fallback cuando extract_flat falla en listas RD.
-    yt-dlp maneja internamente la paginación del mix.
+    Descarga un Radio/Mix directamente sin pre-fetch.
+    Limita a `limit` canciones para evitar la generación infinita de YouTube.
     """
     results = {'ok': 0, 'skipped': 0, 'error': 0}
+    downloaded_ids: set = set()
 
     def _hook(d: dict) -> None:
         if d['status'] == 'finished':
             fname = Path(d.get('filename', '')).stem
+            vid = d.get('info_dict', {}).get('id', '')
+            if vid in downloaded_ids:
+                results['skipped'] += 1
+                return
+            if vid:
+                downloaded_ids.add(vid)
             print(f"  [ok]   {fname}")
             results['ok'] += 1
         elif d['status'] == 'error':
@@ -163,6 +177,7 @@ def download_mix_direct(url: str, output_dir: Path, quality: str) -> dict:
         'postprocessors': _postprocessors(quality),
         'writethumbnail': True,
         'yes_playlist': True,
+        'playlistend': limit,       # ← clave: corta el mix al llegar al límite
         'ignoreerrors': True,
         'retries': 3,
         'fragment_retries': 3,
@@ -171,7 +186,7 @@ def download_mix_direct(url: str, output_dir: Path, quality: str) -> dict:
         'no_warnings': True,
     }
 
-    print("Descargando Radio/Mix directamente (sin pre-fetch)...")
+    print(f"Descargando Radio/Mix (máximo {limit} canciones)...")
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
@@ -183,6 +198,7 @@ def download_playlist(
     workers: int = 4,
     quality: str = '0',
     output_base: Path = Path('.'),
+    mix_limit: int = MIX_DEFAULT_LIMIT,
 ) -> None:
     clean_url, url_type = normalize_playlist_url(url)
 
@@ -191,24 +207,27 @@ def download_playlist(
     if clean_url != url:
         print(f"URL procesada  : {clean_url}")
 
+    # Para mixes, limitar el pre-fetch al mismo límite de descarga
+    fetch_limit = mix_limit if url_type == 'mix' else 0
     print("Fetching playlist info...")
-    info = fetch_playlist_info(clean_url)
-    entries = [e for e in (info or {}).get('entries', []) if e]
+    info = fetch_playlist_info(clean_url, limit=fetch_limit)
+    entries = _dedupe_entries([e for e in (info or {}).get('entries', []) if e])
 
-    # Para mixes que no responden al extract_flat, descarga directa con yt-dlp
+    # Mixes sin entradas en el pre-fetch → descarga directa con límite
     if not entries and url_type == 'mix':
-        print("Pre-fetch no disponible para este Mix. Cambiando a modo descarga directa...")
+        print("Pre-fetch no disponible. Usando descarga directa con límite...")
         playlist_title = sanitize_filename((info or {}).get('title', 'YouTube Mix'))
         output_dir = output_base / playlist_title
         output_dir.mkdir(parents=True, exist_ok=True)
         quality_label = "VBR best" if quality == '0' else f"CBR {quality} kbps"
         print(f"Playlist : {playlist_title}")
+        print(f"Límite   : {mix_limit} canciones")
         print(f"Quality  : {quality_label}")
         print(f"Output   : {output_dir.resolve()}")
         print()
-        results = download_mix_direct(clean_url, output_dir, quality)
+        results = download_mix_direct(clean_url, output_dir, quality, mix_limit)
         print()
-        print(f"Done — {results['ok']} downloaded, {results['error']} errors")
+        print(f"Done — {results['ok']} downloaded, {results['skipped']} skipped, {results['error']} errors")
         print(f"Files saved to: {output_dir.resolve()}")
         return
 
@@ -226,7 +245,7 @@ def download_playlist(
 
     quality_label = "VBR best (~245 kbps avg)" if quality == '0' else f"CBR {quality} kbps"
     print(f"Playlist : {playlist_title}")
-    print(f"Tracks   : {total}")
+    print(f"Tracks   : {total}" + (f" (límite: {mix_limit})" if url_type == 'mix' else ""))
     print(f"Quality  : {quality_label}")
     print(f"Output   : {output_dir.resolve()}")
     print(f"Workers  : {workers}")
@@ -262,42 +281,44 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description='Download a YouTube playlist as MP3 files.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
+        epilog=f"""
+Ejemplos:
   python downloader.py "https://www.youtube.com/playlist?list=PLxxxxx"
-  python downloader.py "https://www.youtube.com/playlist?list=PLxxxxx" -w 2
+  python downloader.py "https://www.youtube.com/watch?v=XXX&list=RDxxx" --mix-limit 25
   python downloader.py "https://www.youtube.com/playlist?list=PLxxxxx" -o ~/Music --cbr
         """,
     )
-    parser.add_argument('url', help='YouTube playlist URL')
+    parser.add_argument('url', help='URL de la playlist o video de YouTube')
     parser.add_argument(
         '-w', '--workers',
-        type=int,
-        default=4,
-        metavar='N',
-        help='Number of concurrent downloads (default: 4)',
+        type=int, default=4, metavar='N',
+        help='Descargas simultáneas (default: 4)',
     )
     parser.add_argument(
         '-o', '--output',
-        type=Path,
-        default=Path('.'),
-        metavar='DIR',
-        help='Base output directory (default: current directory)',
+        type=Path, default=Path('.'), metavar='DIR',
+        help='Carpeta de destino (default: directorio actual)',
     )
     parser.add_argument(
         '--cbr',
         action='store_true',
-        help='Use CBR 320 kbps instead of VBR best quality',
+        help='CBR 320 kbps en lugar de VBR best quality',
+    )
+    parser.add_argument(
+        '--mix-limit',
+        type=int, default=MIX_DEFAULT_LIMIT, metavar='N',
+        help=f'Límite de canciones para Radio/Mix (default: {MIX_DEFAULT_LIMIT}). '
+             'YouTube genera estos mixes infinitamente.',
     )
 
     args = parser.parse_args()
-    quality = '320' if args.cbr else '0'
 
     download_playlist(
         url=args.url,
         workers=args.workers,
-        quality=quality,
+        quality='320' if args.cbr else '0',
         output_base=args.output,
+        mix_limit=args.mix_limit,
     )
 
 
