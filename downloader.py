@@ -29,20 +29,44 @@ def sanitize_filename(name: str) -> str:
     return name or 'unknown'
 
 
-def normalize_playlist_url(url: str) -> str:
+# Prefijos de listas que YouTube genera dinámicamente y requieren el v= del video
+# para poder ser consultadas. Convertirlas a playlist?list= las rompe.
+_DYNAMIC_LIST_PREFIXES = ('RD', 'RDEM', 'RDMIX', 'RDCLAK', 'OLA', 'FL', 'LL')
+
+
+def normalize_playlist_url(url: str) -> tuple[str, str]:
     """
-    Extrae el list= de cualquier formato de URL de YouTube y devuelve
-    una URL limpia de playlist. Soporta:
-      - https://www.youtube.com/watch?v=XXX&list=YYY&start_radio=1
-      - https://www.youtube.com/playlist?list=YYY
-      - https://youtu.be/XXX?list=YYY
+    Analiza la URL y devuelve (url_para_fetch, tipo).
+
+    Tipos:
+      'playlist' → lista normal PL..., puede usarse como playlist?list=
+      'mix'      → Radio/Mix RD..., requiere conservar el v= original
+      'unknown'  → sin list=, se usará la URL tal cual
+
+    Soporta todos estos formatos:
+      https://www.youtube.com/watch?v=XXX&list=PLyyy
+      https://www.youtube.com/watch?v=XXX&list=RDxxx&start_radio=1
+      https://www.youtube.com/playlist?list=PLyyy
+      https://youtu.be/XXX?list=PLyyy
     """
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
     list_id = params.get('list', [None])[0]
-    if list_id:
-        return f"https://www.youtube.com/playlist?list={list_id}"
-    return url
+    video_id = params.get('v', [None])[0]
+
+    if not list_id:
+        return url, 'unknown'
+
+    # Radio/Mix: conservar v= para que YouTube pueda generar la lista
+    if list_id.startswith(_DYNAMIC_LIST_PREFIXES):
+        if video_id:
+            clean = f"https://www.youtube.com/watch?v={video_id}&list={list_id}"
+        else:
+            clean = url
+        return clean, 'mix'
+
+    # Lista normal: URL canónica sin parámetros extra
+    return f"https://www.youtube.com/playlist?list={list_id}", 'playlist'
 
 
 def download_track(
@@ -107,14 +131,14 @@ def download_track(
         progress_bar.update(1)
 
 
-def fetch_playlist_info(url: str) -> dict:
+def fetch_playlist_info(url: str, is_mix: bool = False) -> dict:
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
         'extract_flat': True,
         'skip_download': True,
-        'yes_playlist': True,       # fuerza modo playlist aunque la URL lleve v=
-        'ignoreerrors': True,       # omite videos privados/eliminados sin abortar
+        'yes_playlist': True,   # fuerza modo playlist aunque la URL lleve v=
+        'ignoreerrors': True,   # omite videos privados/eliminados sin abortar
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(url, download=False)
@@ -126,24 +150,28 @@ def download_playlist(
     quality: str = '0',
     output_base: Path = Path('.'),
 ) -> None:
-    # Normalizar URL: extrae list= de cualquier formato mixto de YouTube
-    clean_url = normalize_playlist_url(url)
+    clean_url, url_type = normalize_playlist_url(url)
+
+    type_labels = {'playlist': 'Lista normal', 'mix': 'Radio/Mix', 'unknown': 'URL directa'}
+    print(f"Tipo detectado : {type_labels.get(url_type, url_type)}")
     if clean_url != url:
-        print(f"URL normalizada: {clean_url}")
+        print(f"URL procesada  : {clean_url}")
 
     print("Fetching playlist info...")
-    info = fetch_playlist_info(clean_url)
+    info = fetch_playlist_info(clean_url, is_mix=(url_type == 'mix'))
 
     if not info:
-        print("Error: could not retrieve playlist information.")
+        print("Error: no se pudo obtener información de la lista.")
         sys.exit(1)
 
-    # Aceptar _type 'playlist' y también mixes/radios que yt-dlp clasifica diferente
     entries = [e for e in info.get('entries', []) if e]
     if not entries:
-        print("Error: la lista está vacía, es privada o la URL no contiene una playlist.")
-        print(f"  _type detectado: {info.get('_type', 'desconocido')}")
-        print(f"  URL usada: {clean_url}")
+        print("Error: la lista está vacía, es privada o la URL no es válida.")
+        print(f"  _type detectado : {info.get('_type', 'desconocido')}")
+        print(f"  URL usada       : {clean_url}")
+        if url_type == 'mix':
+            print("  Nota: los Radio/Mix de YouTube limitan las pistas visibles.")
+            print("  Intenta con una lista de reproducción normal (PL...).")
         sys.exit(1)
 
     playlist_title = sanitize_filename(info.get('title', 'playlist'))

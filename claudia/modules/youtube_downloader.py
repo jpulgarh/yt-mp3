@@ -51,7 +51,7 @@ class YouTubeDownloaderModule(BaseModule):
             root = Path(__file__).parent.parent.parent
             sys.path.insert(0, str(root))
             from downloader import download_playlist, normalize_playlist_url
-            clean_url = normalize_playlist_url(url)
+            clean_url, _ = normalize_playlist_url(url)
             download_playlist(url=clean_url, output_base=output_dir)
             speak("La descarga de la lista de reproducción ha terminado.")
         except Exception as e:
