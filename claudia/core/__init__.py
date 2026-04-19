@@ -1,1 +1,0 @@
-"""Núcleo del sistema Claudia."""
